@@ -2,3 +2,5 @@ __pycache__/
 syk_results/
 syk_histogram_N*.png
 syk_eigenvalues_N*.npy
+syk_spectrum_realization0_N*.txt
+syk_statistics_N*.npz

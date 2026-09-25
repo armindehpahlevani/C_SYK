@@ -69,3 +69,40 @@ spectrum.
 For the density of states at large N, the usual approach combines exact
 results up to N of about 32 with the analytic large-N form: the Q-Hermite
 density of Garcia-Garcia and Verbaarschot, and Cotler et al.
+
+---
+
+# Full-spectrum exact diagonalization: `majorana_SYK_fast.py`
+
+`majorana_SYK_fast.py` computes the **complete** spectrum of every disorder
+realization, the same way as `majorana_SYK_reference.py`, only faster. The
+reference file is the previous version, kept unchanged, and the fast
+program checks itself against it every time it starts.
+
+Install (one time):
+
+    pip install numpy scipy matplotlib numba psutil threadpoolctl
+
+Run:
+
+| Goal | Command |
+|---|---|
+| Default run (N=22, 200 realizations) | `python majorana_SYK_fast.py` |
+| Choose N and the number of realizations | `python majorana_SYK_fast.py --N 26 --realizations 100` |
+| Timing table, old vs. new code | `python majorana_SYK_fast.py --benchmark` |
+| Find the largest N your laptop can handle | `python majorana_SYK_fast.py --auto-max-N` |
+| All options | `python majorana_SYK_fast.py --help` |
+
+The first run takes 10–20 s longer because Numba compiles its kernels.
+Later runs load them from a cache.
+
+Outputs:
+- `syk_eigenvalues_N{N}.npy`: all eigenvalues of all realizations, as a flat
+  array. Use `np.load(...).reshape(n_realizations, 2**(N//2))` to get one
+  row per realization. The file is written as the run proceeds.
+- `syk_histogram_N{N}.png`: the density of states.
+- `syk_spectrum_realization0_N{N}.txt`: the full spectrum of realization 0.
+- `syk_statistics_N{N}.npz`: E0 and <r> for every realization.
+
+See `SYK_PERFORMANCE_REPORT.md` for how it works, benchmarks and the laptop
+limit.
