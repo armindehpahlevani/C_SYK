@@ -1,2 +1,4 @@
 __pycache__/
 syk_results/
+syk_histogram_N*.png
+syk_eigenvalues_N*.npy
