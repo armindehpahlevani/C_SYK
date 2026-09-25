@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 majorana_SYK_fast.py -- full exact diagonalization of the q=4 Majorana SYK
 model, optimized for an ordinary laptop (CPU only).
