@@ -4,3 +4,5 @@ syk_histogram_N*.png
 syk_eigenvalues_N*.npy
 syk_spectrum_realization0_N*.txt
 syk_statistics_N*.npz
+syk_fig*_N*.png
+syk_paper_figures_N*.npz

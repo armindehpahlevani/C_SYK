@@ -2,14 +2,14 @@
 majorana_SYK_fast.py -- full exact diagonalization of the q=4 Majorana SYK
 model, optimized for an ordinary laptop (CPU only).
 
-Model (unchanged from majorana_SYK_reference.py)
-------------------------------------------------
+Model
+-----
     chi_{2K}   = Z_0 ... Z_{K-1} X_K / sqrt2
     chi_{2K+1} = Z_0 ... Z_{K-1} Y_K / sqrt2          {chi_a, chi_b} = delta_ab
     H = sum_{i<j<k<l} J_ijkl chi_i chi_j chi_k chi_l,  <J_ijkl^2> = 3! J^2 / N^3
 
-Architecture (measurements and reasoning: SYK_PERFORMANCE_REPORT.md)
---------------------------------------------------------------------
+Architecture
+------------
 config -> validation -> precomputation (Pauli strings, masks, basis, symmetry
 maps; once per N) -> per realization: couplings -> Numba assembly directly into
 the final Fortran-ordered LAPACK array -> symmetry-reduced dense
@@ -28,12 +28,25 @@ even Majoranas) commutes with H and T^2 = (-1)^(n(n-1)/2), n = N/2:
   N mod 8 = 4 : T keeps parity, T^2=-1 -> Kramers pairs in each block (GSE).
                 Both blocks diagonalized; one level per pair used for <r>.
 
+Figures 2-4 of Gur-Ari, Mahajan & Vaezi, arXiv:1806.10145 (PAPER_FIGURES)
+--------------------------------------------------------------------------
+  Fig. 2   spectral form factor g(beta,t) = <|Z(beta+it)|^2> / <Z(beta)>^2
+  Fig. 3a  distribution of the lowest spacing E1-E0 vs. the Wigner surmise
+  Fig. 3b  distribution of log r_n, r_n = (E_n-E_{n+1})/(E_{n+1}-E_{n+2}),
+           for the lowest EDGE_LEVELS levels vs. RMT and uncorrelated levels
+  Fig. 4   ground-state energy distribution vs. Gaussian and Tracy-Widom,
+           with the skewness/kurtosis table (Table 1)
+  Saved as syk_fig2_sff_N*.png, syk_fig3_level_spacing_N*.png,
+  syk_fig4_ground_state_N*.png and the data in syk_paper_figures_N*.npz.
+
 Usage
 -----
     python majorana_SYK_fast.py                         # defaults below
     python majorana_SYK_fast.py --N 26 --realizations 100
     python majorana_SYK_fast.py --benchmark             # timing table
     python majorana_SYK_fast.py --auto-max-N            # find laptop limit
+    python majorana_SYK_fast.py --N 22 --realizations 2000   # paper figures
+    python majorana_SYK_fast.py --no-paper              # skip Figs. 2-4
     python majorana_SYK_fast.py --help                  # all options
 
 Requirements:  pip install numpy scipy matplotlib numba
@@ -55,8 +68,17 @@ MAX_MEMORY_FRACTION = 0.75    # never plan to use more of the available RAM
 MAX_RUNTIME_PER_REALIZATION = 300.0   # seconds, for --auto-max-N
 AUTO_BENCHMARK = False        # True = behave like --auto-max-N
 BENCHMARK_N = [16, 18, 20, 22, 24, 26, 28]
-OLD_BENCHMARK_MAX_N = 26      # also time the reference code up to this N
 SHOW_PLOT = True              # open the histogram window at the end
+
+# --- Figs. 2-4 of Gur-Ari, Mahajan & Vaezi, "Does the SYK model have a spin
+#     glass phase?", arXiv:1806.10145 -------------------------------------
+PAPER_FIGURES = True          # compute and plot the quantities of Figs. 2-4
+SFF_BETAS = (50.0, 5.0, 0.0)  # inverse temperatures for Fig. 2 (paper: 50)
+SFF_T_RANGE = (1e-2, 1e7)     # time window of Fig. 2
+SFF_POINTS = 300              # log-spaced times
+EDGE_LEVELS = 20              # lowest levels per sector for Fig. 3b (paper: 20)
+USE_BOTH_EDGES = True         # top edge of H(J) = bottom edge of H(-J): an
+                              # equally likely realization (as in the paper)
 # =============================================================================
 
 import argparse
@@ -75,7 +97,10 @@ import multiprocessing as mp
 
 import numpy as np
 import scipy
+import scipy.integrate
 import scipy.linalg
+import scipy.special
+from scipy.interpolate import CubicSpline
 
 try:
     from numba import njit, prange
@@ -85,8 +110,7 @@ except ImportError:                                   # pure NumPy fallback
     HAVE_NUMBA = False
 
 # Mean spacing ratio for large random matrices (Atas et al., PRL 110, 084101
-# (2013), numerical large-N values; the 3x3 "surmise" values 0.536/0.603/0.676
-# printed by the old code are slightly off).
+# (2013), numerical large-N values).
 R_REFERENCE = {"Poisson": 0.3863, "GOE": 0.5307, "GUE": 0.5996, "GSE": 0.6744}
 
 TWO_STAGE_MIN_DIM = 4096      # below this, SciPy's driver is as fast (measured)
@@ -705,7 +729,200 @@ def sector_statistics(sym, e):
     return r.sum(), len(r), rc.sum(), len(rc), split
 
 
-def compute_realization(st, solver, J_, seed, idx):
+# =============================================================================
+# QUANTITIES OF FIGS. 2-4 OF arXiv:1806.10145
+# =============================================================================
+# Fig. 2   spectral form factor  g(beta, t) = <|Z(beta + i t)|^2> / <Z(beta)>^2
+# Fig. 3a  distribution of the lowest level spacing E1 - E0 (Wigner surmise)
+# Fig. 3b  distribution of log r_n, r_n = (E_n - E_{n+1}) / (E_{n+1} - E_{n+2}),
+#          over the lowest EDGE_LEVELS levels (RMT vs. uncorrelated levels)
+# Fig. 4   distribution of the ground-state energy (Gaussian vs. Tracy-Widom)
+# Edge statistics are taken inside one independent symmetry sector, after
+# removing Kramers partners, exactly like <r> above.
+
+RMT_BETA = {"GOE": 1, "GUE": 2, "GSE": 4}
+
+WIGNER_SURMISE = {
+    "GOE": lambda s: np.pi / 2 * s * np.exp(-np.pi * s ** 2 / 4),
+    "GUE": lambda s: 32 / np.pi ** 2 * s ** 2 * np.exp(-4 * s ** 2 / np.pi),
+    "GSE": lambda s: 2 ** 18 / (3 ** 6 * np.pi ** 3) * s ** 4
+    * np.exp(-64 * s ** 2 / (9 * np.pi)),
+    "Poisson": lambda s: np.exp(-s),
+}
+
+_RATIO_NORM = {1: 8 / 27, 2: 4 * np.pi / (81 * np.sqrt(3)),
+               4: 4 * np.pi / (729 * np.sqrt(3))}
+
+# mean, variance, skewness, kurtosis of the LARGEST eigenvalue (Tracy-Widom);
+# the smallest eigenvalue has the same numbers with the skewness negated
+TW_MOMENTS = {1: (-1.2065335745820, 1.607781034581, 0.293464524080, 3.1652429),
+              2: (-1.771086807411, 0.813194792832, 0.224084203610, 3.0934481),
+              4: (-2.306884893241, 0.517723720776, 0.165509494, 3.0491952)}
+
+
+def p_log_r(x, cls):
+    """Density of x = log r for r = s_n / s_{n+1} (consecutive spacings).
+
+    RMT: P(r) = (r + r^2)^b / (Z_b (1 + r + r^2)^(1 + 3b/2))  (Atas et al.,
+    PRL 110, 084101); uncorrelated levels: P(r) = 1/(1 + r)^2.  P(log r) =
+    r P(r)."""
+    r = np.exp(-np.abs(x))                 # P(log r) is symmetric in log r
+    if cls == "Poisson":
+        return r / (1 + r) ** 2
+    b = RMT_BETA[cls]
+    return r * (r + r * r) ** b / (1 + r + r * r) ** (1 + 1.5 * b) \
+        / _RATIO_NORM[b]
+
+
+def _tw_cdf(beta, s, m=100, L=20.0):
+    """Tracy-Widom distribution F_beta(s) as a Fredholm determinant,
+    evaluated with Gauss-Legendre quadrature (Bornemann, Math. Comp. 2010)."""
+    xg, wg = np.polynomial.legendre.leggauss(m)
+    sw = np.sqrt(wg * L / 2)
+    if beta == 2:                                   # Airy kernel on (s, inf)
+        x = s + (xg + 1) * L / 2
+        ai, aip, _, _ = scipy.special.airy(x)
+        dx = x[:, None] - x[None, :]
+        np.fill_diagonal(dx, 1.0)
+        K = (ai[:, None] * aip[None, :] - aip[:, None] * ai[None, :]) / dx
+        np.fill_diagonal(K, aip ** 2 - x * ai ** 2)
+        return np.linalg.det(np.eye(m) - sw[:, None] * K * sw[None, :])
+    x = (xg + 1) * L / 2                            # (1/2) Ai((x+y)/2 + t)
+    t = s if beta == 1 else np.sqrt(2) * s
+    A = 0.5 * scipy.special.airy((x[:, None] + x[None, :]) / 2 + t)[0]
+    M = sw[:, None] * A * sw[None, :]
+    d_minus = np.linalg.det(np.eye(m) - M)
+    if beta == 1:
+        return d_minus
+    return 0.5 * (d_minus + np.linalg.det(np.eye(m) + M))
+
+
+def tracy_widom_density(beta):
+    """(grid, density) of the largest-eigenvalue Tracy-Widom law."""
+    s = np.linspace(-9.0, 10.0, 191)
+    F = np.array([_tw_cdf(beta, v) for v in s])
+    grid = np.linspace(-9.0, 10.0, 4001)
+    f = np.clip(CubicSpline(s, F).derivative()(grid), 0.0, None)
+    return grid, f / scipy.integrate.trapezoid(f, grid)
+
+
+def density_moments(x, f):
+    mu = scipy.integrate.trapezoid(x * f, x)
+    var = scipy.integrate.trapezoid((x - mu) ** 2 * f, x)
+    sk = scipy.integrate.trapezoid((x - mu) ** 3 * f, x) / var ** 1.5
+    ku = scipy.integrate.trapezoid((x - mu) ** 4 * f, x) / var ** 2
+    return mu, var, sk, ku
+
+
+def sample_moments(x):
+    x = np.asarray(x, float).ravel()
+    d = x - x.mean()
+    var = (d ** 2).mean()
+    return x.mean(), var, (d ** 3).mean() / var ** 1.5, \
+        (d ** 4).mean() / var ** 2
+
+
+def bootstrap_moments(X, n_boot=500, seed=0):
+    """Moments of X (realizations x samples) with errors from resampling
+    whole realizations (top/bottom edges of one realization stay together)."""
+    X = np.asarray(X, float).reshape(len(X), -1)
+    rng = np.random.default_rng(seed)
+    est = np.array(sample_moments(X))
+    if len(X) < 3:
+        return est, np.full(4, np.nan)
+    boots = [sample_moments(X[rng.integers(0, len(X), len(X))])
+             for _ in range(n_boot)]
+    return est, np.std(boots, axis=0, ddof=1)
+
+
+def distinct_levels(sym, sectors):
+    """Distinct energies of the full Hilbert space and their multiplicity."""
+    if sym["mirror"]:
+        return sectors[0], 2.0
+    if sym["kramers"]:
+        return np.sort(np.concatenate([e[0::2] for e in sectors])), 2.0
+    return np.sort(np.concatenate(sectors)), 1.0
+
+
+def edge_levels(sym, sectors, K):
+    """(sectors, 2, K): lowest K levels of every independent sector of H
+    (edge 0) and of -H (edge 1 = top edge), Kramers partners removed."""
+    out = np.empty((len(sectors), 2, K))
+    for i, e in enumerate(sectors):
+        if sym["kramers"]:
+            e = e[0::2]
+        out[i, 0] = e[:K]
+        out[i, 1] = -e[::-1][:K]
+    return out
+
+
+def sff_terms(levels, mult, betas, t, chunk=4096):
+    """Partition-function pieces of one realization, for H and for -H.
+
+    With x = E - E_min:  Z(beta + it) = e^a Zhat(t) up to a phase,
+    a = -beta E_min.  Returns a (nb, 2), |Zhat(t)|^2 (nb, 2, nt), Zhat(0)
+    (nb, 2) and the plateau sum  sum_E (mult e^{-beta x})^2  (nb, 2).
+    -H has the phases complex conjugated, so both share one phase matrix."""
+    x = levels - levels[0]
+    xt = x[-1] - x
+    nb, nt = len(betas), len(t)
+    W = np.empty((len(x), 2 * nb))
+    for k, b in enumerate(betas):
+        W[:, k] = mult * np.exp(-b * x)
+        W[:, nb + k] = mult * np.exp(-b * xt)
+    Zt = np.zeros((nt, 2 * nb), np.complex128)
+    for c0 in range(0, len(x), chunk):
+        Zt += np.exp(-1j * np.outer(t, x[c0:c0 + chunk])) @ W[c0:c0 + chunk]
+    b = np.asarray(betas, float)
+    a = np.stack([-b * levels[0], b * levels[-1]], axis=1)
+    S2 = (Zt.real ** 2 + Zt.imag ** 2).T.reshape(2, nb, nt).transpose(1, 0, 2)
+    Z0 = W.sum(0).reshape(2, nb).T
+    P2 = (W ** 2).sum(0).reshape(2, nb).T
+    return a, S2, Z0, P2
+
+
+class SFFAccumulator:
+    """Disorder averages <|Z(beta+it)|^2>, <Z(beta)> without overflow."""
+
+    def __init__(self, betas, t):
+        nb = len(betas)
+        self.M = np.full(nb, -np.inf)
+        self.S2 = np.zeros((nb, len(t)))
+        self.S1 = np.zeros(nb)
+        self.P = np.zeros(nb)
+        self.n = 0
+
+    def add(self, a, S2, Z0, P2):            # columns of axis 1 = samples
+        for k in range(len(self.M)):
+            m = max(self.M[k], a[k].max())
+            old = np.exp(self.M[k] - m) if np.isfinite(self.M[k]) else 0.0
+            f = np.exp(a[k] - m)
+            self.S2[k] = self.S2[k] * old ** 2 + (f[:, None] ** 2
+                                                  * S2[k]).sum(0)
+            self.S1[k] = self.S1[k] * old + (f * Z0[k]).sum()
+            self.P[k] = self.P[k] * old ** 2 + (f ** 2 * P2[k]).sum()
+            self.M[k] = m
+        self.n += a.shape[1]
+
+    def g(self):
+        return (self.S2 / self.n) / (self.S1[:, None] / self.n) ** 2
+
+    def plateau(self):
+        """Long-time value: <sum_E mult^2 e^{-2 beta E}> / <Z(beta)>^2."""
+        return (self.P / self.n) / (self.S1 / self.n) ** 2
+
+
+def paper_setup(st):
+    if not PAPER_FIGURES:
+        return None
+    per_sector = st.D // 2 if st.sym["kramers"] else st.D
+    return dict(K=min(EDGE_LEVELS, per_sector),
+                betas=np.asarray(SFF_BETAS, float),
+                t=np.logspace(np.log10(SFF_T_RANGE[0]),
+                              np.log10(SFF_T_RANGE[1]), SFF_POINTS))
+
+
+def compute_realization(st, solver, J_, seed, idx, paper=None):
     t0 = time.perf_counter()
     w = st.term_weights(realization_couplings(st.N, J_, seed, idx))
     t_build = time.perf_counter() - t0
@@ -724,12 +941,19 @@ def compute_realization(st, solver, J_, seed, idx):
     stats = [sector_statistics(st.sym, e) for e in sectors]
     parts = sectors * 2 if st.sym["mirror"] else sectors
     spectrum = np.sort(np.concatenate(parts))
-    return dict(idx=idx, spectrum=spectrum, E0=float(spectrum[0]),
-                r_sum=sum(s[0] for s in stats), r_n=sum(s[1] for s in stats),
-                rc_sum=sum(s[2] for s in stats),
-                rc_n=sum(s[3] for s in stats),
-                kramers_split=max(s[4] for s in stats),
-                t_build=t_build, t_diag=t_diag)
+    out = dict(idx=idx, spectrum=spectrum, E0=float(spectrum[0]),
+               r_sum=sum(s[0] for s in stats), r_n=sum(s[1] for s in stats),
+               rc_sum=sum(s[2] for s in stats),
+               rc_n=sum(s[3] for s in stats),
+               kramers_split=max(s[4] for s in stats),
+               t_build=t_build, t_diag=t_diag, t_paper=0.0)
+    if paper is not None:
+        t = time.perf_counter()
+        levels, mult = distinct_levels(st.sym, sectors)
+        out["edges"] = edge_levels(st.sym, sectors, paper["K"])
+        out["sff"] = sff_terms(levels, mult, paper["betas"], paper["t"])
+        out["t_paper"] = time.perf_counter() - t
+    return out
 
 
 def warm_up(solver, J_=1.0, seed=0):
@@ -742,17 +966,18 @@ def warm_up(solver, J_=1.0, seed=0):
 _WORKER = {}
 
 
-def _worker_init(N_, J_, seed, allow_two_stage, force_numpy):
+def _worker_init(N_, J_, seed, allow_two_stage, force_numpy, paper):
     if force_numpy:
         use_numpy_kernels()
     _WORKER.update(st=SYKStructure(N_), solver=Eigensolver(allow_two_stage),
-                   J=J_, seed=seed)
+                   J=J_, seed=seed, paper=paper)
     warm_up(_WORKER["solver"], J_, seed)
 
 
 def _worker_run(idx):
     w = _WORKER
-    return compute_realization(w["st"], w["solver"], w["J"], w["seed"], idx)
+    return compute_realization(w["st"], w["solver"], w["J"], w["seed"], idx,
+                               w["paper"])
 
 
 # =============================================================================
@@ -774,7 +999,7 @@ def kron_list(ms):
 
 
 def dense_majoranas(N):
-    """Original kron construction (qubit 0 = most significant index bit)."""
+    """Dense kron construction (qubit 0 = most significant index bit)."""
     p = pauli_matrices()
     n = N // 2
     return [(1 / np.sqrt(2)) * kron_list(
@@ -827,7 +1052,87 @@ class Validator:
         return [r for r in self.results if r[1] is False]
 
 
-def run_validation(st, solver, J_, seed):
+def validate_paper_tools(V, sym, seed):
+    """Checks of every formula used for Figs. 2-4; returns the Tracy-Widom
+    density of this N's symmetry class."""
+    trap = scipy.integrate.trapezoid
+    s = np.linspace(0.0, 50.0, 100001)
+    err = max(max(abs(trap(P(s), s) - 1), abs(trap(s * P(s), s) - 1))
+              for P in WIGNER_SURMISE.values())
+    V.record("Wigner surmises (GOE/GUE/GSE/Poisson): normalized, mean "
+             "spacing 1", err < 1e-6, f"max err {err:.1e}")
+
+    x = np.linspace(-30.0, 30.0, 600001)
+    exact = {"Poisson": 2 * np.log(2) - 1, "GOE": 4 - 2 * np.sqrt(3),
+             "GUE": 2 * np.sqrt(3) / np.pi - 0.5,
+             "GSE": 32 * np.sqrt(3) / (15 * np.pi) - 0.5}
+    err = 0.0
+    for c, val in exact.items():
+        f = p_log_r(x, c)
+        err = max(err, abs(trap(f, x) - 1),
+                  abs(trap(np.exp(-np.abs(x)) * f, x) - val))
+    V.record("P(log r): normalized, <min(r,1/r)> = exact values "
+             "(Poisson 2ln2-1, GOE 4-2sqrt3, ...)", err < 1e-6,
+             f"max err {err:.1e}")
+
+    # the same pipeline on random matrices of this N's class
+    cls = sym["rmt"]
+    rng = np.random.default_rng(seed)
+    n = 96
+    cplx = lambda m: rng.normal(size=(m, m)) + 1j * rng.normal(size=(m, m))
+    logr = []
+    for _ in range(200):
+        if cls == "GOE":
+            A = rng.normal(size=(n, n))
+            H = A + A.T
+        elif cls == "GUE":
+            A = cplx(n)
+            H = A + A.conj().T
+        else:                                       # quaternion-real (GSE)
+            A, B = cplx(n // 2), cplx(n // 2)
+            A, B = A + A.conj().T, B - B.T
+            H = np.block([[A, B], [-B.conj(), A.conj()]])
+        e = np.linalg.eigvalsh(H)
+        if cls == "GSE":
+            e = e[0::2]
+        e = e[len(e) // 4: 3 * len(e) // 4]
+        d = np.diff(e)
+        logr.append(np.log(d[:-1] / d[1:]))
+    logr = np.concatenate(logr)
+    h, edges = np.histogram(logr, bins=30, range=(-3, 3))
+    dens = h / (len(logr) * np.diff(edges))
+    dev = np.abs(dens - p_log_r(0.5 * (edges[1:] + edges[:-1]), cls)).max()
+    rt = np.exp(-np.abs(logr)).mean()
+    V.record(f"random {cls} matrices: log r histogram matches P(log r)",
+             dev < 0.07 and abs(rt - R_REFERENCE[cls]) < 0.015,
+             f"max density deviation {dev:.3f}, <min(r,1/r)> = {rt:.3f}")
+
+    # spectral form factor pieces vs. direct sum
+    lev = np.sort(rng.normal(size=60))
+    betas, tt = np.array([0.0, 1.3]), np.array([0.0, 0.7, 5.0])
+    a, S2, Z0, P2 = sff_terms(lev, 2.0, betas, tt)
+    err = 0.0
+    for k, b in enumerate(betas):
+        for e, E in enumerate((lev, -lev)):
+            Z = (2.0 * np.exp(-(b + 1j * tt[:, None]) * E[None, :])).sum(1)
+            err = max(err, np.abs(np.exp(2 * a[k, e]) * S2[k, e]
+                                  - np.abs(Z) ** 2).max() / np.abs(Z[0]) ** 2,
+                      abs(np.exp(a[k, e]) * Z0[k, e] - Z[0].real)
+                      / abs(Z[0]))
+    V.record("spectral form factor: |Z(beta+it)|^2 == direct sum over "
+             "levels, H and -H", err < 1e-10, f"max rel. err {err:.1e}")
+
+    b = RMT_BETA[cls]
+    grid, f = tracy_widom_density(b)
+    mom = density_moments(grid, f)
+    err = max(abs(u - v) for u, v in zip(mom, TW_MOMENTS[b]))
+    V.record(f"Tracy-Widom beta={b} density: mean, variance, skewness, "
+             f"kurtosis match the literature", err < 2e-3,
+             f"max err {err:.1e}")
+    return grid, f
+
+
+def run_validation(st, solver, J_, seed, paper=None):
     V = Validator()
     tol = 1e-10
 
@@ -918,28 +1223,6 @@ def run_validation(st, solver, J_, seed):
         V.record(f"N={Ns} ({sym['rmt']}): {msg}", err < tol,
                  f"max err {err:.1e}")
 
-    # 5 & 7. old (reference file) vs new, same couplings
-    try:
-        import majorana_SYK_reference as ref
-    except ImportError:
-        ref = None
-    if ref is None:
-        V.record("reference implementation comparison", None,
-                 "majorana_SYK_reference.py not found next to this file")
-    else:
-        worst, count = 0.0, 0
-        for Ns, reps in ((8, 2), (10, 2), (12, 3), (14, 3), (16, 2), (18, 1)):
-            s2 = SYKStructure(Ns)
-            for k in range(reps):
-                Jc = realization_couplings(Ns, J_, seed + 7, k)
-                e_old = ref.diagonalize(ref.build_hamiltonian(Ns, Jc))
-                e_new = spectrum_new(s2, solver, s2.term_weights(Jc))
-                worst = max(worst, np.abs(e_old - e_new).max())
-                count += 1
-        V.record("same couplings -> same spectrum as majorana_SYK_reference",
-                 worst < tol, f"{count} realizations, N=8..18, "
-                              f"max |dE| = {worst:.1e}")
-
     # 6. reproducibility
     s12 = SYKStructure(12)
     a = compute_realization(s12, solver, J_, seed, 3)
@@ -980,6 +1263,7 @@ def run_validation(st, solver, J_, seed):
     if solver.two_stage:
         V.record("2-stage LAPACK eigensolver agrees with SciPy", True,
                  "checked at start-up, real and complex")
+    V.tw = validate_paper_tools(V, st.sym, seed) if paper else None
     return V
 
 
@@ -1051,6 +1335,181 @@ def plot_histogram(evs, N_, n_real, show, bins=60):
     return fname
 
 
+_PALETTE = ("#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300")
+_FILL = "#86b6ef"
+
+
+def _pyplot(show):
+    import matplotlib
+    if not show:
+        matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    return plt
+
+
+def _style(ax):
+    ax.grid(True, color="#e3e3df", linewidth=0.6)
+    ax.set_axisbelow(True)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+
+
+def _density_hist(ax, data, bins, label):
+    h, edges = np.histogram(data, bins=bins)
+    dens = h / (len(data) * np.diff(edges))          # all samples count
+    ax.bar(edges[:-1], dens, width=np.diff(edges), align="edge",
+           color=_FILL, edgecolor="white", linewidth=1.0, label=label)
+    return edges, dens
+
+
+def paper_report(st, paper, edges, sff, n_edges, tw, n_real, show):
+    """Print and plot the quantities of Figs. 2-4 of arXiv:1806.10145."""
+    N_, cls = st.N, st.sym["rmt"]
+    E = edges[:, :, :n_edges, :]                 # (real., sectors, edges, K)
+    R, S, K = E.shape[0], E.shape[1], E.shape[3]
+    edge_txt = "both spectral edges" if n_edges == 2 else "bottom edge"
+    print("\nFigures 2-4 of arXiv:1806.10145 (Gur-Ari, Mahajan, Vaezi):")
+    print(f"  data: {R} realizations x {edge_txt} x {S} independent "
+          f"sector(s), RMT class {cls}")
+    plt = _pyplot(show)
+    files = []
+
+    # ---- Fig. 2: spectral form factor -----------------------------------
+    t, betas = paper["t"], paper["betas"]
+    g, plat = sff.g(), sff.plateau()
+    print("  Fig. 2  spectral form factor g(beta,t) = <|Z(beta+it)|^2> / "
+          "<Z(beta)>^2")
+    fig, ax = plt.subplots(figsize=(7, 4.6))
+    for k, b in enumerate(betas):
+        c = _PALETTE[k % len(_PALETTE)]
+        late = g[k][t >= t[-1] / 10].mean()
+        smooth = np.convolve(np.log(g[k]), np.ones(9) / 9, mode="same")
+        i = int(np.argmin(smooth[4:-4])) + 4
+        dip = (f"dip {g[k][i]:.2e} at t = {t[i]:.3g}"
+               if np.exp(smooth[i]) < 0.5 * late else
+               "no clear dip/ramp (too few levels contribute: needs "
+               "larger N or smaller beta)")
+        print(f"    beta = {b:<5g}: g(0) = {g[k][0]:.3f}, {dip}, plateau "
+              f"{late:.2e} (predicted {plat[k]:.2e})")
+        ax.loglog(t, g[k], color=c, linewidth=2,
+                  label=f"beta = {b:g}" + ("  (paper)" if b == 50 else ""))
+        ax.axhline(plat[k], color=c, linewidth=1, linestyle=":")
+    ax.plot([], [], color="#6b6b66", linestyle=":", linewidth=1,
+            label="predicted plateau")
+    ax.set_xlabel("t")
+    ax.set_ylabel("g(beta, t)")
+    ax.set_title(f"Fig. 2: spectral form factor, N={N_}, {sff.n} samples")
+    ax.legend(frameon=False, fontsize=9)
+    _style(ax)
+    fig.tight_layout()
+    files.append(f"syk_fig2_sff_N{N_}.png")
+    fig.savefig(files[-1], dpi=150)
+
+    # ---- Fig. 3: level statistics at the edge ---------------------------
+    gap = E[..., 1] - E[..., 0]
+    s_norm = (gap / gap.mean(axis=(0, 2), keepdims=True)).ravel()
+    sp = np.diff(E, axis=-1)
+    logr = np.log(sp[..., :-1] / sp[..., 1:])          # (R, S, e, K-2)
+    rt_real = np.exp(-np.abs(logr)).reshape(R, -1).mean(1)
+    rt_err = rt_real.std(ddof=1) / np.sqrt(R) if R > 1 else np.nan
+    ss = np.linspace(0, 15, 30001)
+    m2 = {c: scipy.integrate.trapezoid(ss ** 2 * WIGNER_SURMISE[c](ss), ss)
+          for c in (cls, "Poisson")}
+    print(f"  Fig. 3a  lowest spacing E1 - E0 (mean set to 1): "
+          f"<s^2> = {np.mean(s_norm ** 2):.3f}   "
+          f"({cls} surmise {m2[cls]:.3f}, uncorrelated 2.000)")
+    print(f"  Fig. 3b  log r_n over the lowest {K} levels: <min(r,1/r)> = "
+          f"{rt_real.mean():.4f} +- {rt_err:.4f}   ({cls} "
+          f"{R_REFERENCE[cls]}, uncorrelated / spin glass "
+          f"{R_REFERENCE['Poisson']})")
+
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(11, 4.4))
+    _density_hist(a1, s_norm, np.linspace(0, 3.5, 15), "SYK")
+    a1.plot(ss[ss <= 3.5], WIGNER_SURMISE[cls](ss[ss <= 3.5]),
+            color=_PALETTE[1], linewidth=2, label=f"{cls} (Wigner surmise)")
+    a1.plot(ss[ss <= 3.5], np.exp(-ss[ss <= 3.5]), color=_PALETTE[2],
+            linewidth=2, linestyle="--", label="uncorrelated (Poisson)")
+    a1.set_xlabel("(E1 - E0) / <E1 - E0>")
+    a1.set_ylabel("probability density")
+    a1.set_title("(a) lowest level spacing")
+    xx = np.linspace(-2.5, 2.5, 501)
+    _density_hist(a2, logr.ravel(), np.linspace(-2.5, 2.5, 41), "SYK")
+    a2.plot(xx, p_log_r(xx, cls), color=_PALETTE[1], linewidth=2,
+            label=f"{cls}")
+    a2.plot(xx, p_log_r(xx, "Poisson"), color=_PALETTE[2], linewidth=2,
+            linestyle="--", label="uncorrelated (Poisson)")
+    a2.set_xlabel("log r_n")
+    a2.set_title(f"(b) log r_n, lowest {K} levels")
+    for a in (a1, a2):
+        a.legend(frameon=False, fontsize=9)
+        _style(a)
+    fig.suptitle(f"Fig. 3: level statistics at the spectral edge, N={N_}, "
+                 f"{R * n_edges * S} samples")
+    fig.tight_layout()
+    files.append(f"syk_fig3_level_spacing_N{N_}.png")
+    fig.savefig(files[-1], dpi=150)
+
+    # ---- Fig. 4 / Table 1: ground-state energy distribution -------------
+    b = RMT_BETA[cls]
+    if tw is None:
+        tw = tracy_widom_density(b)
+    rows = [("even-parity sector (as in paper)" if S == 2 else
+             "ground state", E[:, 0, :, 0])]
+    if S == 2:
+        rows += [("odd-parity sector", E[:, 1, :, 0]),
+                 ("true ground state (both sectors)", E[:, :, :, 0].min(1))]
+    print("  Fig. 4 / Table 1  ground-state energy distribution")
+    print(f"    {'distribution':<46}{'skewness':>17}{'kurtosis':>15}")
+    print(f"    {'Gaussian':<46}{0.0:>17.3f}{3.0:>15.3f}")
+    for name, bb in (("GOE", 1), ("GUE", 2), ("GSE", 4)):
+        print(f"    {'Tracy-Widom (' + name + ')':<46}"
+              f"{-TW_MOMENTS[bb][2]:>17.3f}{TW_MOMENTS[bb][3]:>15.3f}")
+    first = None
+    for label, X in rows:
+        est, err = bootstrap_moments(X)
+        first = first or (est, err)
+        print(f"    {'SYK N=' + str(N_) + ' (' + cls + ') ' + label:<46}"
+              f"{est[2]:>9.3f} +- {err[2]:.3f}{est[3]:>8.2f} +- "
+              f"{err[3]:.2f}")
+    est, err = first
+    if err[2] > 0:
+        print(f"    -> skewness is {abs(est[2]) / err[2]:.1f} sigma from "
+              f"Gaussian and {abs(est[2] + TW_MOMENTS[b][2]) / err[2]:.1f} "
+              f"sigma from Tracy-Widom ({cls})")
+    if not err[2] < 0.05:
+        print("    (to separate Gaussian from Tracy-Widom the error must be "
+              "~0.02: the paper used 10^4 realizations)")
+
+    X = rows[0][1].ravel()
+    mu, var = X.mean(), X.var()
+    sd = np.sqrt(var)
+    fig, ax = plt.subplots(figsize=(7, 4.6))
+    _density_hist(ax, X, 40, "SYK")
+    ee = np.linspace(X.min() - 0.5 * sd, X.max() + 0.5 * sd, 600)
+    ax.plot(ee, np.exp(-(ee - mu) ** 2 / (2 * var)) / np.sqrt(2 * np.pi
+            * var), color=_PALETTE[1], linewidth=2, label="Gaussian")
+    m_tw, v_tw = TW_MOMENTS[b][0], TW_MOMENTS[b][1]
+    sc = np.sqrt(v_tw) / sd       # E = mu - sd (s - m_tw)/sqrt(v_tw)
+    ax.plot(ee, sc * np.interp(m_tw - (ee - mu) * sc, *tw), color=_PALETTE[2],
+            linewidth=2, linestyle="--", label=f"Tracy-Widom ({cls})")
+    ax.set_xlabel("E0")
+    ax.set_ylabel("probability density")
+    ax.set_title(f"Fig. 4: ground-state energy, N={N_}, {X.size} samples")
+    ax.legend(frameon=False, fontsize=9)
+    _style(ax)
+    fig.tight_layout()
+    files.append(f"syk_fig4_ground_state_N{N_}.png")
+    fig.savefig(files[-1], dpi=150)
+    if not show:
+        plt.close("all")
+
+    files.append(f"syk_paper_figures_N{N_}.npz")
+    np.savez(files[-1], t=t, betas=betas, g=g, g_plateau=plat,
+             spacing_E1_E0=s_norm, log_r=logr.ravel(),
+             ground_state=rows[0][1], edge_levels=E, rmt_class=cls)
+    return files
+
+
 def print_spectrum(spec, N_):
     fname = f"syk_spectrum_realization0_N{N_}.txt"
     np.savetxt(fname, spec, header=f"all {len(spec)} eigenvalues, N={N_}, "
@@ -1110,13 +1569,20 @@ def run(args):
     st = SYKStructure(N_)
     solver = Eigensolver(not args.no_two_stage)
     t_pre = time.perf_counter() - t
+    paper = None if args.no_paper else paper_setup(st)
+    n_edges = 2 if USE_BOTH_EDGES else 1
     print(f"eigensolver          : {solver.description()}")
+    if paper is not None:
+        print(f"paper figures        : Figs. 2-4 of arXiv:1806.10145 "
+              f"(SFF beta = {', '.join(f'{b:g}' for b in paper['betas'])}; "
+              f"lowest {paper['K']} levels per sector; "
+              f"{'both edges' if n_edges == 2 else 'bottom edge'})")
     print(f"precomputation       : {t_pre:.2f} s "
           f"({st.n_terms} couplings in {len(st.gmask)} flip-mask groups)")
 
     if not args.no_validate:
         print("\nValidation:")
-        V = run_validation(st, solver, J_, seed)
+        V = run_validation(st, solver, J_, seed, paper)
         if V.failed():
             print("\nVALIDATION FAILED -- results would not be trustworthy.")
             return 1
@@ -1132,8 +1598,12 @@ def run(args):
     rc_real = np.empty(n_real)
     r_sum = r_n = rc_sum = rc_n = 0.0
     split = 0.0
-    t_build = t_diag = 0.0
+    t_build = t_diag = t_paper = 0.0
     spectrum0 = None
+    tw = V.tw if not args.no_validate else None
+    if paper is not None:
+        edges_all = np.empty((n_real, len(sym["parities"]), 2, paper["K"]))
+        sff_acc = SFFAccumulator(paper["betas"], paper["t"])
 
     print(f"\nDiagonalizing {n_real} realizations "
           f"({jobs} parallel job(s)) ...", flush=True)
@@ -1141,6 +1611,7 @@ def run(args):
 
     def consume(res):
         nonlocal r_sum, r_n, rc_sum, rc_n, split, t_build, t_diag, spectrum0
+        nonlocal t_paper
         i = res["idx"]
         evs_file[i * dim:(i + 1) * dim] = res["spectrum"]
         E0[i] = res["E0"]
@@ -1155,6 +1626,10 @@ def run(args):
         t_diag += res["t_diag"]
         if i == 0:
             spectrum0 = res["spectrum"]
+        if paper is not None:
+            edges_all[i] = res["edges"]
+            sff_acc.add(*(v[:, :n_edges] for v in res["sff"]))
+            t_paper += res["t_paper"]
         progress[0] += 1
         done = progress[0]
         el = time.perf_counter() - t_loop
@@ -1167,14 +1642,14 @@ def run(args):
     progress = [0, -10.0]
     if jobs == 1:
         for i in range(n_real):
-            consume(compute_realization(st, solver, J_, seed, i))
+            consume(compute_realization(st, solver, J_, seed, i, paper))
     else:
         set_thread_env(threads)
         ctx = mp.get_context("spawn")
         with ProcessPoolExecutor(
                 max_workers=jobs, mp_context=ctx, initializer=_worker_init,
                 initargs=(N_, J_, seed, not args.no_two_stage,
-                          args.no_numba)) as ex:
+                          args.no_numba, paper)) as ex:
             chunk = max(1, min(16, n_real // (4 * jobs)))
             for res in ex.map(_worker_run, range(n_real), chunksize=chunk):
                 consume(res)
@@ -1188,6 +1663,8 @@ def run(args):
           f"{t_build / n_real * 1e3:.1f} ms per realization")
     print(f"  Diagonalization          : {t_diag:.2f} s total, "
           f"{t_diag / n_real * 1e3:.1f} ms per realization")
+    if paper is not None:
+        print(f"  Figs. 2-4 quantities     : {t_paper:.2f} s total")
     print(f"  Wall time (realizations) : {wall:.2f} s "
           f"({wall / n_real * 1e3:.1f} ms per realization)")
     print(f"  Peak memory (main proc.) : {fmt_bytes(peak_rss())}")
@@ -1232,14 +1709,20 @@ def run(args):
     np.savez(f"syk_statistics_N{N_}.npz", N=N_, J=J_, seed=seed,
              E0=E0, r_per_realization=r_real,
              r_central_per_realization=rc_real, rmt_class=sym["rmt"])
-    fig = plot_histogram(evs_file, N_, n_real,
-                         show=args.show and not args.no_show)
+    show = args.show and not args.no_show
+    paper_files = []
+    if paper is not None:
+        paper_files = paper_report(st, paper, edges_all, sff_acc, n_edges,
+                                   tw, n_real, show)
+    fig = plot_histogram(evs_file, N_, n_real, show=show)
     print("\nFiles:")
     print(f"  {out_npy}  (flat array of {n_real} x {dim}; "
           f".reshape({n_real}, {dim}))")
     print(f"  {fig}")
     print(f"  {spec_file}")
     print(f"  syk_statistics_N{N_}.npz  (E0 and <r> per realization)")
+    for f in paper_files:
+        print(f"  {f}")
     print(f"\nTotal time: {time.perf_counter() - t_start:.1f} s")
     print(bar)
     del limiter
@@ -1253,33 +1736,13 @@ def run(args):
 def _bench_one(N_, impl, seed, J_):
     """Runs inside a fresh subprocess; prints one JSON line."""
     out = dict(N=N_, impl=impl)
-    if impl == "new":
-        warm_up(Eigensolver(), J_, seed)
-        t = time.perf_counter()
-        st = SYKStructure(N_)
-        solver = Eigensolver()
-        out["precompute"] = time.perf_counter() - t
-        res = compute_realization(st, solver, J_, seed, 0)
-        out.update(build=res["t_build"], diag=res["t_diag"], E0=res["E0"])
-    else:
-        import majorana_SYK_reference as ref
-        t = time.perf_counter()
-        pairs = ref.pair_tables(N_)
-        out["precompute"] = time.perf_counter() - t
-        Jc = realization_couplings(N_, J_, seed, 0)
-        build = diag = 0.0
-        evs = []
-        for p in ref.parity_blocks(N_):
-            t = time.perf_counter()
-            B = ref.build_hamiltonian_block(N_, Jc, pairs, p)
-            build += time.perf_counter() - t
-            t = time.perf_counter()
-            evs.append(scipy.linalg.eigvalsh(B.toarray(), overwrite_a=True,
-                                             check_finite=False))
-            diag += time.perf_counter() - t
-            del B
-        out.update(build=build, diag=diag, E0=float(min(e.min()
-                                                        for e in evs)))
+    warm_up(Eigensolver(), J_, seed)
+    t = time.perf_counter()
+    st = SYKStructure(N_)
+    solver = Eigensolver()
+    out["precompute"] = time.perf_counter() - t
+    res = compute_realization(st, solver, J_, seed, 0)
+    out.update(build=res["t_build"], diag=res["t_diag"], E0=res["E0"])
     out["total"] = out["build"] + out["diag"]
     out["peak"] = peak_rss()
     print("BENCH_JSON " + json.dumps(out), flush=True)
@@ -1303,7 +1766,7 @@ def _bench_subprocess(N_, impl, timeout, seed, J_):
 def _print_bench_row(r):
     sym = symmetry_info(r["N"])
     D = 2 ** (r["N"] // 2 - 1)
-    kind = "real" if sym["real_basis"] and r["impl"] == "new" else "cplx"
+    kind = "real" if sym["real_basis"] else "cplx"
     head = (f"{r['N']:>4} {2 ** (r['N'] // 2):>8} {D:>6} "
             f"{len(sym['parities'])}x{kind:<4} {sym['rmt']:<4} ")
     if "error" in r:
@@ -1313,43 +1776,23 @@ def _print_bench_row(r):
                  f"{fmt_bytes(r['peak']):>10}")
 
 
-def benchmark(Ns, old_max, max_frac, max_runtime, seed, J_):
+def benchmark(Ns, max_frac, max_runtime, seed, J_):
     avail = available_memory()
     print(f"CPU: {cpu_name()}  ({physical_cores()} cores)")
     print(f"BLAS: {blas_description()}")
     print(f"RAM available: {fmt_bytes(avail)}\n")
-    hdr = (f"{'N':>4} {'dim':>8} {'D':>6} {'sectors':<7} {'RMT':<4} "
-           f"{'build[s]':>9} {'diag[s]':>9} {'total[s]':>9} {'peak mem':>10}")
-    results = {"new": {}, "old": {}}
-    for impl in ("new", "old"):
-        print(("NEW implementation" if impl == "new" else
-               "OLD implementation (majorana_SYK_reference.py)") +
-              ", one realization per N (fresh process each):")
-        print(hdr)
-        for N_ in Ns:
-            if impl == "old" and N_ > old_max:
-                continue
-            need = estimate_memory(N_)[0] if impl == "new" else \
-                2 * 16 * 4 ** (N_ // 2 - 1) + BASE_PROCESS_BYTES
-            if avail is not None and need > max_frac * avail:
-                print(f"{N_:>4}  skipped: needs ~{fmt_bytes(need)}")
-                continue
-            r = _bench_subprocess(N_, impl, max_runtime * 3 + 120, seed, J_)
-            results[impl][N_] = r
-            _print_bench_row(r)
-        print()
-    print("Speed-up per realization (old total / new total):")
-    for N_, r in results["old"].items():
-        n = results["new"].get(N_)
-        if n and "error" not in r and "error" not in n:
-            mem = ""
-            if r.get("peak") and n.get("peak"):
-                mem = (f", peak memory {fmt_bytes(r['peak'])} -> "
-                       f"{fmt_bytes(n['peak'])}")
-            print(f"  N={N_}: old {r['total']:.3f} s, new {n['total']:.3f} s,"
-                  f" speed-up {r['total'] / n['total']:.1f}x{mem}; "
-                  f"same couplings: |E0_old - E0_new| = "
-                  f"{abs(r['E0'] - n['E0']):.1e}")
+    print("One realization per N (fresh process each):")
+    print(f"{'N':>4} {'dim':>8} {'D':>6} {'sectors':<7} {'RMT':<4} "
+          f"{'build[s]':>9} {'diag[s]':>9} {'total[s]':>9} {'peak mem':>10}")
+    results = {}
+    for N_ in Ns:
+        need = estimate_memory(N_)[0]
+        if avail is not None and need > max_frac * avail:
+            print(f"{N_:>4}  skipped: needs ~{fmt_bytes(need)}")
+            continue
+        r = _bench_subprocess(N_, "new", max_runtime * 3 + 120, seed, J_)
+        results[N_] = r
+        _print_bench_row(r)
     return results
 
 
@@ -1419,11 +1862,11 @@ def parse_args(argv=None):
                    help="seconds per realization for --auto-max-N")
     p.add_argument("--benchmark", nargs="*", type=int, metavar="N",
                    help=f"benchmark mode (default N list {BENCHMARK_N})")
-    p.add_argument("--old-max-N", type=int, default=OLD_BENCHMARK_MAX_N,
-                   help="largest N to benchmark the reference code")
     p.add_argument("--auto-max-N", action="store_true",
                    default=AUTO_BENCHMARK)
     p.add_argument("--no-validate", action="store_true")
+    p.add_argument("--no-paper", action="store_true",
+                   help="skip the Figs. 2-4 quantities of arXiv:1806.10145")
     p.add_argument("--no-numba", action="store_true",
                    help="use the pure NumPy kernels")
     p.add_argument("--no-two-stage", action="store_true",
@@ -1448,7 +1891,7 @@ def main(argv=None):
         _bench_one(args._bench_one, args._impl, args.seed, args.J)
         return 0
     if args.benchmark is not None:
-        benchmark(args.benchmark or BENCHMARK_N, args.old_max_N,
+        benchmark(args.benchmark or BENCHMARK_N,
                   args.max_memory_fraction, args.max_runtime, args.seed,
                   args.J)
         return 0
